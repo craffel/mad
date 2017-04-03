@@ -1,13 +1,17 @@
 """Example soft monotonic alignment decoder implementation.
 
-Can be used directly in place of tf.nn.seq2seq.attention_decoder.  This
-implementation attempts to deviate as little as possible from
-tf.nn.seq2seq.attention_decoder, in order to facilitate comparison between the
-two decoders. """
-
-import tensorflow as tf
-from tensorflow.python.util.nest import is_sequence, flatten
+This file contains an example TensorFlow implementation of the approach
+described in ``Online and Linear-Time Attention by Enforcing Monotonic
+Alignments''.  The function monotonic_attention covers the algorithms in the
+paper and should be general-purpose.  monotonic_alignment_decoder can be used
+directly in place of tf.nn.seq2seq.attention_decoder.  This implementation
+attempts to deviate as little as possible from tf.nn.seq2seq.attention_decoder,
+in order to facilitate comparison between the two decoders.
+"""
 import numpy as np
+import tensorflow as tf
+from tensorflow.python.util.nest import flatten
+from tensorflow.python.util.nest import is_sequence
 
 
 def safe_cumprod(x, **kwargs):
@@ -15,63 +19,82 @@ def safe_cumprod(x, **kwargs):
   return tf.exp(tf.cumsum(tf.log(tf.clip_by_value(x, 1e-10, 1)), **kwargs))
 
 
-def linear(args, output_size, bias, bias_start=0.0, scope=None):
-  """Linear map: sum_i(args[i] * W[i]), where W[i] is a variable.
+def monotonic_attention(p_choose_i, previous_attention, mode):
+  """Compute monotonic attention distribution from choosing probabilities.
 
-  Note: Copied from
-  https://github.com/tensorflow/tensorflow/blob/c2c4c208679305d6d538255be569a2822f1c920f/tensorflow/python/ops/rnn_cell_impl.py#L821
+  Monotonic attention implies that the input sequence is processed in an
+  explicitly left-to-right manner when generating the output sequence.  In
+  addition, once an input sequence element is attended to at a given output
+  timestep, elements occurring before it cannot be attended to at subsequent
+  output timesteps.  This function generates attention distributions according
+  to these assumptions.  For more information, see ``Online and Linear-Time
+  Attention by Enforcing Monotonic Alignments''.
 
   Args:
-    args: a 2D Tensor or a list of 2D, batch x n, Tensors.
-    output_size: int, second dimension of W[i].
-    bias: boolean, whether to add a bias term or not.
-    bias_start: starting value to initialize the bias; 0 by default.
-    scope: (optional) Variable scope to create parameters in.
+    p_choose_i: Probability of choosing input sequence/memory element i.  Should
+      be of shape (batch_size, input_sequence_length), and should all be in the
+      range [0, 1].
+    previous_attention: The attention distribution from the previous output
+      timestep.  Should be of shape (batch_size, input_sequence_length).  For
+      the first output timestep, preevious_attention[n] should be [1, 0, 0, ...,
+      0] for all n in [0, ... batch_size - 1].
+    mode: How to compute the attention distribution.  Must be one of
+      'recursive', 'parallel', or 'hard'.
+        * 'recursive' uses tf.scan to recursively compute the distribution.
+          This is slowest but is exact, general, and does not suffer from
+          numerical instabilities.
+        * 'parallel' uses parallelized cumulative-sum and cumulative-product
+          operations to compute a closed-form solution to the recurrence
+          relation defining the attention distribution.  This makes it more
+          efficient than 'recursive', but it requires numerical checks which
+          make the distribution non-exact.  This can be a problem in particular
+          when input_sequence_length is long and/or p_choose_i has entries very
+          close to 0 or 1.
+        * 'hard' requires that the probabilities in p_choose_i are all either 0
+          or 1, and subsequently uses a more efficient and exact solution.
 
   Returns:
-    A 2D Tensor with shape [batch x output_size] equal to
-    sum_i(args[i] * W[i]), where W[i]s are newly created matrices.
+    A tensor of shape (batch_size, input_sequence_length) representing the
+    attention distributions for each sequence in the batch.
 
   Raises:
-    ValueError: if some of the arguments has unspecified or wrong shape.
+    ValueError: mode is not one of 'recursive', 'parallel', 'hard'.
   """
-  if args is None or (is_sequence(args) and not args):
-    raise ValueError("`args` must be specified")
-  if not is_sequence(args):
-    args = [args]
-
-  # Calculate the total size of arguments on dimension 1.
-  total_arg_size = 0
-  shapes = [a.get_shape() for a in args]
-  for shape in shapes:
-    if shape.ndims != 2:
-      raise ValueError("linear is expecting 2D arguments: %s" % shapes)
-    if shape[1].value is None:
-      raise ValueError("linear expects shape[1] to be provided for shape %s, "
-                       "but saw %s" % (shape, shape[1]))
-    else:
-      total_arg_size += shape[1].value
-
-  dtype = [a.dtype for a in args][0]
-
-  # Now the computation.
-  scope = tf.get_variable_scope()
-  with tf.variable_scope(scope) as outer_scope:
-    weights = tf.get_variable(
-        "weights", [total_arg_size, output_size], dtype=dtype)
-    if len(args) == 1:
-      res = tf.matmul(args[0], weights)
-    else:
-      res = tf.matmul(tf.concat(args, 1), weights)
-    if not bias:
-      return res
-    with tf.variable_scope(outer_scope) as inner_scope:
-      inner_scope.set_partitioner(None)
-      biases = tf.get_variable(
-          "biases", [output_size],
-          dtype=dtype,
-          initializer=tf.constant_initializer(bias_start, dtype=dtype))
-  return tf.nn.bias_add(res, biases)
+  if mode == "recursive":
+    batch_size = tf.shape(p_choose_i)[0]
+    # Compute [1, 1 - p_choose_i[0], 1 - p_choose_i[1], ..., 1 - p_choose_i[-2]]
+    shifted_1mp_choose_i = tf.concat(
+        [tf.ones((batch_size, 1)), 1 - p_choose_i[:, :-1]], 1)
+    # Compute attention distribution recursively as
+    # q[i] = (1 - p_choose_i[i])*q[i - 1] + previous_attention[i]
+    # attention[i] = p_choose_i[i]*q[i]
+    attention = p_choose_i*tf.transpose(tf.scan(
+        # Need to use reshape to remind TF of the shape between loop iterations
+        lambda x, yz: tf.reshape(yz[0]*x + yz[1], (batch_size,)),
+        # Loop variables yz[0] and yz[1]
+        [tf.transpose(shifted_1mp_choose_i), tf.transpose(previous_attention)],
+        # Initial value of x is just zeros
+        tf.zeros((batch_size,))))
+  elif mode == "parallel":
+    # safe_cumprod computes cumprod in logspace with numeric checks
+    cumprod_1mp_choose_i = safe_cumprod(1 - p_choose_i, axis=1, exclusive=True)
+    # Compute recurrence relation solution
+    attention = p_choose_i*cumprod_1mp_choose_i*tf.cumsum(
+        previous_attention /
+        # Clip cumprod_1mp to avoid divide-by-zero
+        tf.clip_by_value(cumprod_1mp_choose_i, 1e-10, 1.), axis=1)
+  elif mode == "hard":
+    # Remove any probabilities before the index chosen last time step
+    p_choose_i *= tf.cumsum(previous_attention, axis=1)
+    # Now, use exclusive cumprod to remove probabilities after the first
+    # chosen index, like so:
+    # p_choose_i = [0, 0, 0, 1, 1, 0, 1, 1]
+    # cumprod(1 - p_choose_i, exclusive=True) = [1, 1, 1, 1, 0, 0, 0, 0]
+    # Product of above: [0, 0, 0, 1, 0, 0, 0, 0]
+    attention = p_choose_i*tf.cumprod(1 - p_choose_i, axis=1, exclusive=True)
+  else:
+    raise ValueError("mode must be 'recursive', 'parallel', or 'hard'.")
+  return attention
 
 
 def monotonic_alignment_decoder(
@@ -167,7 +190,7 @@ def monotonic_alignment_decoder(
     hidden = tf.reshape(
         attention_states, [-1, attn_length, 1, attn_size])
     hidden_features = []
-    v, b, c, g = [], [], [], []
+    v, b, r, g = [], [], [], []
     attention_vec_size = attn_size  # Size of query vectors for attention.
     for a in range(num_heads):
       k = tf.get_variable("AttnW_%d" % a,
@@ -176,8 +199,8 @@ def monotonic_alignment_decoder(
       init = tf.random_normal_initializer(stddev=1./attention_vec_size)
       v.append(tf.get_variable(
           "AttnV_%d" % a, [attention_vec_size], initializer=init))
-      c.append(tf.get_variable(
-          "AttnC_%d" % a, [],
+      r.append(tf.get_variable(
+          "AttnR_%d" % a, [],
           initializer=tf.constant_initializer(initial_energy_bias)))
       b.append(tf.get_variable(
           "AttnB_%d" % a, [attention_vec_size],
@@ -190,10 +213,10 @@ def monotonic_alignment_decoder(
 
     state = initial_state
 
-    def attention(query, masks):
+    def attention(query, previous_attentions):
       """Put attention masks on hidden using hidden_features and query."""
       ds = []  # Results of attention reads will be stored here.
-      output_masks = []
+      alignments = []
       if is_sequence(query):  # If the query is a tuple, flatten it.
         query_list = flatten(query)
         for q in query_list:  # Check that ndims == 2 if specified.
@@ -202,43 +225,47 @@ def monotonic_alignment_decoder(
             assert ndims == 2
         query = tf.concat(1, query_list)
       for a in range(num_heads):
-        with tf.variable_scope("Attention_%d" % a):
-          mask = masks[a]
-          y = linear(query, attention_vec_size, True)
+        with tf.variable_scope("Attention_%d" % a) as scope:
+          previous_attention = previous_attentions[a]
+          y = tf.contrib.layers.linear(query, attention_vec_size, scope=scope,
+                                       biases_initializer=None)
           y = tf.reshape(y, [-1, 1, 1, attention_vec_size])
-          normed_v = g[a]*v[a]/tf.sqrt(tf.reduce_sum(v[a]**2))
+          normed_v = g[a]*v[a]/tf.norm(v[a])
           # Attention mask is a softmax of v^T * tanh(...).
           s = tf.reduce_sum(normed_v*tf.tanh(hidden_features[a] + y + b[a]),
                             [2, 3])
-          s += c[a]
+          s += r[a]
           if hard_sigmoid:
+            # At test time (i.e. not computing gradients), use hard sigmoid
             a = tf.cast(tf.greater(s, 0.), s.dtype)
+            attention = monotonic_attention(a, previous_attention, "hard")
           else:
             a = tf.nn.sigmoid(
                 s + sigmoid_noise_std_dev*tf.random_normal(tf.shape(s)))
-          a *= safe_cumprod(1 - a, axis=1, exclusive=True)
-          a *= mask
-          mask = tf.cumsum(a, axis=1, exclusive=False)
-          output_masks.append(mask)
+            attention = monotonic_attention(a, previous_attention, "recursive")
+          alignments.append(attention)
           # Now calculate the attention-weighted vector d.
           d = tf.reduce_sum(
-              tf.reshape(a, [-1, attn_length, 1, 1]) * hidden,
+              tf.reshape(attention, [-1, attn_length, 1, 1]) * hidden,
               [1, 2])
           ds.append(tf.reshape(d, [-1, attn_size]))
-      return ds, output_masks
+      return ds, alignments
 
     outputs = []
     prev = None
     batch_attn_size = tf.stack([batch_size, attn_size])
     attns = [tf.zeros(batch_attn_size, dtype=dtype)
              for _ in range(num_heads)]
-    # This soft mask prevents the mechanism from choosing the same entry again
-    masks = [tf.ones((batch_size, attn_length), dtype=dtype)
-             for _ in range(num_heads)]
+    # Initialize the first alignment to dirac distributions which will cause
+    # the attention to compute the right thing without special casing
+    all_alignments = [
+        [tf.one_hot(tf.zeros((batch_size,), tf.int32), attn_length, dtype=dtype)
+         for _ in range(num_heads)]]
     for a in attns:  # Ensure the second shape of attention vectors is set.
       a.set_shape([None, attn_size])
     if initial_state_attention:
-      attns, masks = attention(initial_state, masks)
+      attns, alignments = attention(initial_state, all_alignments[-1])
+      all_alignments.append(alignments)
     for i, inp in enumerate(decoder_inputs):
       if i > 0:
         tf.get_variable_scope().reuse_variables()
@@ -250,18 +277,23 @@ def monotonic_alignment_decoder(
       input_size = inp.get_shape().with_rank(2)[1]
       if input_size.value is None:
         raise ValueError("Could not infer input size from input: %s" % inp.name)
-      x = linear([inp] + attns, input_size, True)
+      input_size = input_size.value
+      x = tf.contrib.layers.linear(tf.concat([inp] + attns, 1), input_size,
+                                   reuse=i > 0, scope=tf.get_variable_scope())
       # Run the RNN.
       cell_output, state = cell(x, state)
       # Run the attention mechanism.
       if i == 0 and initial_state_attention:
         with tf.variable_scope(tf.get_variable_scope(), reuse=True):
-          attns, masks = attention(state, masks)
+          attns, alignments = attention(state, all_alignments[-1])
       else:
-        attns, masks = attention(state, masks)
+        attns, alignments = attention(state, all_alignments[-1])
+      all_alignments.append(alignments)
 
       with tf.variable_scope("AttnOutputProjection"):
-        output = linear([cell_output] + attns, output_size, True)
+        output = tf.contrib.layers.linear(
+            tf.concat([cell_output] + attns, 1), output_size, reuse=i > 0,
+            scope=tf.get_variable_scope())
       if loop_function is not None:
         prev = output
       outputs.append(output)
