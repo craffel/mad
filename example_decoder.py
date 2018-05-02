@@ -237,6 +237,8 @@ def monotonic_alignment_decoder(
           s += r[a]
           if hard_sigmoid:
             # At test time (i.e. not computing gradients), use hard sigmoid
+            # Note that s are pre-sigmoid logits, so thresholding around 0
+            # is equivalent to thresholding the probability around 0.5
             a = tf.cast(tf.greater(s, 0.), s.dtype)
             attention = monotonic_attention(a, previous_attention, "hard")
           else:
